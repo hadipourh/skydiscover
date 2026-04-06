@@ -9,6 +9,7 @@ produce actionable breakthrough ideas.
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from skydiscover.llm.llm_pool import LLMPool
@@ -139,14 +140,45 @@ class ParadigmGenerator:
                 result = await self.llm_pool.generate(
                     system_message=self._get_system_message(),
                     messages=[{"role": "user", "content": prompt}],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "paradigm_ideas",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "ideas": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "idea": {"type": "string"},
+                                                "description": {"type": "string"},
+                                                "what_to_optimize": {"type": "string"},
+                                                "cautions": {"type": "string"},
+                                                "approach_type": {"type": "string"},
+                                            },
+                                            "required": ["idea", "description", "what_to_optimize", "cautions", "approach_type"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                },
+                                "required": ["ideas"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
                 )
                 response = result.text
 
                 if not response:
                     logger.warning(f"Empty response from LLM (attempt {attempt + 1}/{MAX_RETRIES})")
                     last_error = "Empty response"
-                    # Don't retry for empty response - likely a parsing issue
-                    break
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= BACKOFF_MULTIPLIER
+                    continue
 
                 paradigms = self._parse_response(response)
 
@@ -155,8 +187,11 @@ class ParadigmGenerator:
                         f"Failed to parse paradigms (attempt {attempt + 1}/{MAX_RETRIES})"
                     )
                     last_error = "Parse failure"
-                    # Don't retry parse failures - the prompt needs fixing
-                    break
+                    if attempt < MAX_RETRIES - 1:
+                        logger.info(f"Retrying paradigm generation in {backoff:.1f}s...")
+                        await asyncio.sleep(backoff)
+                        backoff *= BACKOFF_MULTIPLIER
+                    continue
 
                 logger.info(f"Generated {len(paradigms)} paradigms:")
                 for i, p in enumerate(paradigms):
@@ -200,11 +235,15 @@ class ParadigmGenerator:
                 "been tried."
             )
         return (
-            "You are an expert algorithm researcher. Think carefully and deeply. "
-            "Analyze the problem thoroughly, understand the evaluation metric "
-            "by reading the evaluator code, and suggest breakthrough ideas that are "
-            "correct, actionable, and will actually help improve the solution. "
-            "Focus on ideas that are fundamentally different from what has been tried."
+            "You are an expert algorithm researcher and strategic advisor. "
+            "Your task is to suggest breakthrough algorithmic IDEAS as a JSON array. "
+            "Each idea describes a high-level strategy (not code). "
+            "Think carefully and deeply. Analyze the problem thoroughly, understand "
+            "the evaluation metric by reading the evaluator code, and suggest "
+            "breakthrough ideas that are correct, actionable, and will actually "
+            "help improve the solution. Focus on ideas that are fundamentally "
+            "different from what has been tried. "
+            "You MUST always return at least one idea."
         )
 
     def _build_prompt(
@@ -557,6 +596,9 @@ Specific: "Use scipy.optimize.minimize with SLSQP method"
             return self._build_image_output_format_section()
         return f"""## Output Format
 
+**IMPORTANT:** Respond with a JSON array containing exactly {self.num_paradigms} idea objects.
+Do not include code patches or diffs — describe strategies in natural language.
+
 Generate {self.num_paradigms} breakthrough ideas of DIFFERENT types.
 
 Each idea must be a JSON object with these fields:
@@ -784,58 +826,98 @@ Example:
         """
         Parse LLM response to extract paradigms.
 
+        Uses multiple extraction strategies in order of specificity:
+        1. Direct JSON parse of the full response
+        2. ```json code block extraction
+        3. Any code block (with language-tag stripping)
+        4. Regex scan for the outermost JSON array in raw text
+
         Args:
             response: Raw LLM response
 
         Returns:
             List of validated paradigm dicts
         """
-        # Extract JSON from markdown code blocks if present
         text = response.strip()
+
+        candidates: list[str] = []
+
+        # Strategy 1: full response might be valid JSON
+        candidates.append(text)
+
+        # Strategy 2: ```json ... ``` block
         if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            # Try to find JSON array in any code block
+            extracted = text.split("```json", 1)[1].split("```", 1)[0].strip()
+            if extracted:
+                candidates.append(extracted)
+
+        # Strategy 3: any ``` block, stripping optional language tag
+        if "```" in text:
             parts = text.split("```")
-            for part in parts[1::2]:  # Odd indices are inside code blocks
-                part = part.strip()
-                if part.startswith("["):
-                    text = part
-                    break
+            for part in parts[1::2]:
+                cleaned = part.strip()
+                if cleaned and not cleaned.startswith("["):
+                    first_nl = cleaned.find("\n")
+                    if first_nl != -1:
+                        after_tag = cleaned[first_nl + 1:].strip()
+                        if after_tag.startswith("["):
+                            candidates.append(after_tag)
+                if cleaned.startswith("["):
+                    candidates.append(cleaned)
 
-        try:
-            paradigms = json.loads(text)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse paradigm JSON: {e}")
-            logger.debug(f"Response text: {text[:500]}")
-            return []
+        # Strategy 4: regex – find the outermost [...] in the raw text
+        bracket_match = re.search(r"\[\s*\{", text)
+        if bracket_match:
+            start = bracket_match.start()
+            depth = 0
+            end = start
+            for i in range(start, len(text)):
+                if text[i] == "[":
+                    depth += 1
+                elif text[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end > start:
+                candidates.append(text[start:end])
 
-        if not isinstance(paradigms, list):
-            logger.warning(f"Expected list, got {type(paradigms)}")
-            return []
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                # Handle structured output wrapper: {"ideas": [...]}
+                if isinstance(parsed, dict) and "ideas" in parsed:
+                    parsed = parsed["ideas"]
+                if isinstance(parsed, list):
+                    validated = self._validate_paradigms(parsed)
+                    if validated:
+                        return validated
+            except (json.JSONDecodeError, ValueError):
+                continue
 
-        # Validate each paradigm
+        logger.warning(
+            f"Failed to extract paradigm JSON from response "
+            f"(length={len(text)}, first 300 chars): {text[:300]}"
+        )
+        return []
+
+    def _validate_paradigms(self, paradigms: list) -> List[Dict[str, Any]]:
+        """Validate and normalize a list of raw paradigm dicts."""
         validated = []
         required_keys = ["idea", "description", "approach_type"]
 
         for p in paradigms:
             if not isinstance(p, dict):
                 continue
-
-            # Check required keys
             if not all(k in p for k in required_keys):
                 logger.debug(f"Paradigm missing required keys: {p}")
                 continue
-
-            # Ensure all expected keys exist with defaults
-            validated.append(
-                {
-                    "idea": p.get("idea", ""),
-                    "description": p.get("description", ""),
-                    "what_to_optimize": p.get("what_to_optimize", "score"),
-                    "cautions": p.get("cautions", ""),
-                    "approach_type": p.get("approach_type", "unknown"),
-                }
-            )
+            validated.append({
+                "idea": p.get("idea", ""),
+                "description": p.get("description", ""),
+                "what_to_optimize": p.get("what_to_optimize", "score"),
+                "cautions": p.get("cautions", ""),
+                "approach_type": p.get("approach_type", "unknown"),
+            })
 
         return validated

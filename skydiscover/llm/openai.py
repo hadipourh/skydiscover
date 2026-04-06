@@ -154,6 +154,11 @@ class OpenAILLM(LLMInterface):
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
 
+        # Add response_format if requested (e.g. {"type": "json_object"})
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            params["response_format"] = response_format
+
         retries, retry_delay, timeout = self._resolve_retry_options(**kwargs)
 
         for attempt in range(retries + 1):
