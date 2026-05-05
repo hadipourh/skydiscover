@@ -159,7 +159,13 @@ class ParadigmGenerator:
                                                 "cautions": {"type": "string"},
                                                 "approach_type": {"type": "string"},
                                             },
-                                            "required": ["idea", "description", "what_to_optimize", "cautions", "approach_type"],
+                                            "required": [
+                                                "idea",
+                                                "description",
+                                                "what_to_optimize",
+                                                "cautions",
+                                                "approach_type",
+                                            ],
                                             "additionalProperties": False,
                                         },
                                     },
@@ -865,7 +871,7 @@ Example:
                 if cleaned and not cleaned.startswith("["):
                     first_nl = cleaned.find("\n")
                     if first_nl != -1:
-                        after_tag = cleaned[first_nl + 1:].strip()
+                        after_tag = cleaned[first_nl + 1 :].strip()
                         if after_tag.startswith("["):
                             candidates.append(after_tag)
                 if cleaned.startswith("["):
@@ -918,12 +924,14 @@ Example:
             if not all(k in p for k in required_keys):
                 logger.debug(f"Paradigm missing required keys: {p}")
                 continue
-            validated.append({
-                "idea": p.get("idea", ""),
-                "description": p.get("description", ""),
-                "what_to_optimize": p.get("what_to_optimize", "score"),
-                "cautions": p.get("cautions", ""),
-                "approach_type": p.get("approach_type", "unknown"),
-            })
+            validated.append(
+                {
+                    "idea": p.get("idea", ""),
+                    "description": p.get("description", ""),
+                    "what_to_optimize": p.get("what_to_optimize", "score"),
+                    "cautions": p.get("cautions", ""),
+                    "approach_type": p.get("approach_type", "unknown"),
+                }
+            )
 
         return validated
